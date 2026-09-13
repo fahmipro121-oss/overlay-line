@@ -20,11 +20,15 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.sin
 
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var lineWindow: FrameLayout? = null
+    private var bar: View? = null
     private var menuView: View? = null
     private lateinit var lineParams: WindowManager.LayoutParams
 
@@ -34,7 +38,7 @@ class OverlayService : Service() {
     private var centerY = 0f
     private var angleDeg = -90f
     private var lengthPx = 0f
-    private var boxSize = 0
+    private var thicknessPx = 0
 
     private var mode = "idle"
     private var refTouchX = 0f
@@ -93,44 +97,51 @@ class OverlayService : Service() {
     private fun setupGeometry() {
         val density = resources.displayMetrics.density
         lengthPx = resources.displayMetrics.heightPixels * 0.8f
-        boxSize = (lengthPx + 80 * density).toInt()
+        thicknessPx = (28 * density).toInt()
         centerX = resources.displayMetrics.widthPixels / 2f
         centerY = resources.displayMetrics.heightPixels / 2f
     }
 
-    private fun addLineWindow() {
-        val density = resources.displayMetrics.density
-        val thicknessPx = (4 * density).toInt()
+    // Axis-aligned bounding box of the rotated line, so the touchable
+    // window is only as big as it needs to be for the current angle —
+    // not a full-screen square. Rest of the screen stays clickable.
+    private fun currentBoxSize(): Pair<Int, Int> {
+        val rad = Math.toRadians(angleDeg.toDouble())
+        val w = (lengthPx * abs(sin(rad)) + thicknessPx * abs(cos(rad))).toInt()
+        val h = (lengthPx * abs(cos(rad)) + thicknessPx * abs(sin(rad)))
+        return Pair(max(w, thicknessPx), max(h.toInt(), thicknessPx))
+    }
 
+    private fun addLineWindow() {
         val container = FrameLayout(this)
-        val bar = View(this).apply { setBackgroundColor(Color.WHITE) }
+        val visualBar = View(this).apply { setBackgroundColor(Color.WHITE) }
         val barParams = FrameLayout.LayoutParams(thicknessPx, lengthPx.toInt())
         barParams.gravity = Gravity.CENTER
-        container.addView(bar, barParams)
-        bar.rotation = angleDeg + 90f
+        container.addView(visualBar, barParams)
+        visualBar.rotation = angleDeg + 90f
         lineWindow = container
+        bar = visualBar
 
+        val (boxW, boxH) = currentBoxSize()
         val params = WindowManager.LayoutParams(
-            boxSize,
-            boxSize,
+            boxW,
+            boxH,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = (centerX - boxSize / 2f).toInt()
-        params.y = (centerY - boxSize / 2f).toInt()
+        params.x = (centerX - boxW / 2f).toInt()
+        params.y = (centerY - boxH / 2f).toInt()
         lineParams = params
 
-        container.setOnTouchListener { _, event ->
-            handleTouch(event, container, bar)
-        }
+        container.setOnTouchListener { _, event -> handleTouch(event) }
 
         windowManager.addView(container, params)
     }
 
-    private fun handleTouch(event: MotionEvent, container: FrameLayout, bar: View): Boolean {
+    private fun handleTouch(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 mode = "drag"
@@ -166,14 +177,14 @@ class OverlayService : Service() {
                     val midY = (y0 + y1) / 2f
                     centerX = refCenterX + (midX - refMidX)
                     centerY = refCenterY + (midY - refMidY)
-                    applyGeometry(container, bar)
+                    applyGeometry()
                 } else if (mode == "drag") {
                     val dx = event.rawX - refTouchX
                     val dy = event.rawY - refTouchY
                     if (abs(dx) > 6 || abs(dy) > 6) moved = true
                     centerX = refCenterX + dx
                     centerY = refCenterY + dy
-                    applyGeometry(container, bar)
+                    applyGeometry()
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
@@ -197,11 +208,16 @@ class OverlayService : Service() {
         return true
     }
 
-    private fun applyGeometry(container: FrameLayout, bar: View) {
-        lineParams.x = (centerX - boxSize / 2f).toInt()
-        lineParams.y = (centerY - boxSize / 2f).toInt()
+    private fun applyGeometry() {
+        val container = lineWindow ?: return
+        val visualBar = bar ?: return
+        val (boxW, boxH) = currentBoxSize()
+        lineParams.width = boxW
+        lineParams.height = boxH
+        lineParams.x = (centerX - boxW / 2f).toInt()
+        lineParams.y = (centerY - boxH / 2f).toInt()
         windowManager.updateViewLayout(container, lineParams)
-        bar.rotation = angleDeg + 90f
+        visualBar.rotation = angleDeg + 90f
     }
 
     private fun toggleMenu() {

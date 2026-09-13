@@ -8,7 +8,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
@@ -19,48 +18,49 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var lineWindow: FrameLayout? = null
-    private var moveHandle: View? = null
-    private var rotateHandle: View? = null
     private var menuView: View? = null
-
     private lateinit var lineParams: WindowManager.LayoutParams
-    private lateinit var moveParams: WindowManager.LayoutParams
-    private lateinit var rotateParams: WindowManager.LayoutParams
 
     private val channelId = "overlay_line_channel"
 
     private var centerX = 0f
     private var centerY = 0f
-    private var angleDeg = -90f // -90 = pointing straight up (default vertical line)
-    private var halfLengthPx = 0f
-    private var handleSizePx = 0
+    private var angleDeg = -90f
+    private var lengthPx = 0f
+    private var boxSize = 0
+
+    // gesture state
+    private var mode = "idle"
+    private var refTouchX = 0f
+    private var refTouchY = 0f
+    private var refCenterX = 0f
+    private var refCenterY = 0f
+    private var refAngle = 0f
+    private var refLineAngle = 0f
+    private var refMidX = 0f
+    private var refMidY = 0f
+    private var downTime = 0L
+    private var moved = false
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForegroundNotification()
         setupGeometry()
-        addLineVisual()
-        addMoveHandle()
-        addRotateHandle()
+        addLineWindow()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
-
     override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-    }
+    override fun onTaskRemoved(rootIntent: Intent?) { super.onTaskRemoved(rootIntent) }
 
     private fun startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -72,7 +72,7 @@ class OverlayService : Service() {
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Overlay Line aktif")
-            .setContentText("Seret bulatan tengah = geser, bulatan ujung = putar")
+            .setContentText("1 jari geser, 2 jari putar, tap buka menu")
             .setSmallIcon(android.R.drawable.presence_online)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
@@ -94,37 +94,29 @@ class OverlayService : Service() {
 
     private fun setupGeometry() {
         val density = resources.displayMetrics.density
-        halfLengthPx = (resources.displayMetrics.heightPixels * 0.8f) / 2f
-        handleSizePx = (44 * density).toInt()
+        lengthPx = resources.displayMetrics.heightPixels * 0.8f
+        boxSize = (lengthPx + 80 * density).toInt()
         centerX = resources.displayMetrics.widthPixels / 2f
         centerY = resources.displayMetrics.heightPixels / 2f
     }
 
-    private fun endpointX() = centerX + halfLengthPx * cos(Math.toRadians(angleDeg.toDouble())).toFloat()
-    private fun endpointY() = centerY + halfLengthPx * sin(Math.toRadians(angleDeg.toDouble())).toFloat()
-
-    // ---------- visual line (click-through, purely decorative) ----------
-
-    private fun addLineVisual() {
+    private fun addLineWindow() {
         val density = resources.displayMetrics.density
-        val visualThicknessPx = (4 * density).toInt()
-        val boxSize = (halfLengthPx * 2 + handleSizePx * 2).toInt()
+        val thicknessPx = (4 * density).toInt()
 
-        val box = FrameLayout(this)
+        val container = FrameLayout(this)
         val bar = View(this).apply { setBackgroundColor(Color.WHITE) }
-        val barParams = FrameLayout.LayoutParams(visualThicknessPx, (halfLengthPx * 2).toInt())
+        val barParams = FrameLayout.LayoutParams(thicknessPx, lengthPx.toInt())
         barParams.gravity = Gravity.CENTER
-        box.addView(bar, barParams)
+        container.addView(bar, barParams)
         bar.rotation = angleDeg + 90f
-        lineWindow = box
+        lineWindow = container
 
         val params = WindowManager.LayoutParams(
             boxSize,
             boxSize,
             overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
@@ -132,139 +124,86 @@ class OverlayService : Service() {
         params.y = (centerY - boxSize / 2f).toInt()
         lineParams = params
 
-        windowManager.addView(box, params)
+        container.setOnTouchListener { _, event ->
+            handleTouch(event, container, bar)
+        }
+
+        windowManager.addView(container, params)
     }
 
-    private fun refreshLineVisual() {
-        val box = lineWindow ?: return
-        val boxSize = (halfLengthPx * 2 + handleSizePx * 2).toInt()
+    private fun handleTouch(event: MotionEvent, container: FrameLayout, bar: View): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                mode = "drag"
+                refTouchX = event.rawX
+                refTouchY = event.rawY
+                refCenterX = centerX
+                refCenterY = centerY
+                downTime = System.currentTimeMillis()
+                moved = false
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    mode = "rotate"
+                    val x0 = event.getX(0); val y0 = event.getY(0)
+                    val x1 = event.getX(1); val y1 = event.getY(1)
+                    refAngle = Math.toDegrees(atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
+                    refLineAngle = angleDeg
+                    refMidX = (x0 + x1) / 2f
+                    refMidY = (y0 + y1) / 2f
+                    refCenterX = centerX
+                    refCenterY = centerY
+                    moved = true
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (mode == "rotate" && event.pointerCount >= 2) {
+                    val x0 = event.getX(0); val y0 = event.getY(0)
+                    val x1 = event.getX(1); val y1 = event.getY(1)
+                    val currentAngle = Math.toDegrees(atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
+                    val delta = currentAngle - refAngle
+                    angleDeg = refLineAngle + delta
+                    val midX = (x0 + x1) / 2f
+                    val midY = (y0 + y1) / 2f
+                    centerX = refCenterX + (midX - refMidX)
+                    centerY = refCenterY + (midY - refMidY)
+                    applyGeometry(container, bar)
+                } else if (mode == "drag") {
+                    val dx = event.rawX - refTouchX
+                    val dy = event.rawY - refTouchY
+                    if (abs(dx) > 6 || abs(dy) > 6) moved = true
+                    centerX = refCenterX + dx
+                    centerY = refCenterY + dy
+                    applyGeometry(container, bar)
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                mode = "drag"
+                val remainingIndex = if (event.actionIndex == 0) 1 else 0
+                if (remainingIndex < event.pointerCount) {
+                    refTouchX = lineParams.x + event.getX(remainingIndex)
+                    refTouchY = lineParams.y + event.getY(remainingIndex)
+                }
+                refCenterX = centerX
+                refCenterY = centerY
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val elapsed = System.currentTimeMillis() - downTime
+                if (!moved && elapsed < 500) {
+                    toggleMenu()
+                }
+                mode = "idle"
+            }
+        }
+        return true
+    }
+
+    private fun applyGeometry(container: FrameLayout, bar: View) {
         lineParams.x = (centerX - boxSize / 2f).toInt()
         lineParams.y = (centerY - boxSize / 2f).toInt()
-        windowManager.updateViewLayout(box, lineParams)
-        (box.getChildAt(0))?.rotation = angleDeg + 90f
+        windowManager.updateViewLayout(container, lineParams)
+        bar.rotation = angleDeg + 90f
     }
-
-    // ---------- move handle (center) ----------
-
-    private fun makeHandleView(colorArgb: Int): View {
-        val v = View(this)
-        val bg = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(colorArgb)
-            setStroke(3, Color.WHITE)
-        }
-        v.background = bg
-        return v
-    }
-
-    private fun addMoveHandle() {
-        val handle = makeHandleView(0x99333333.toInt())
-        moveHandle = handle
-
-        val params = WindowManager.LayoutParams(
-            handleSizePx,
-            handleSizePx,
-            overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.x = (centerX - handleSizePx / 2f).toInt()
-        params.y = (centerY - handleSizePx / 2f).toInt()
-        moveParams = params
-
-        var startTouchX = 0f
-        var startTouchY = 0f
-        var startCenterX = 0f
-        var startCenterY = 0f
-        var downTime = 0L
-        val tapDistancePx = 24 * resources.displayMetrics.density
-
-        handle.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    startTouchX = event.rawX
-                    startTouchY = event.rawY
-                    startCenterX = centerX
-                    startCenterY = centerY
-                    downTime = System.currentTimeMillis()
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - startTouchX
-                    val dy = event.rawY - startTouchY
-                    centerX = startCenterX + dx
-                    centerY = startCenterY + dy
-                    moveParams.x = (centerX - handleSizePx / 2f).toInt()
-                    moveParams.y = (centerY - handleSizePx / 2f).toInt()
-                    windowManager.updateViewLayout(moveHandle, moveParams)
-                    refreshLineVisual()
-                    refreshRotateHandlePosition()
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    val totalDx = event.rawX - startTouchX
-                    val totalDy = event.rawY - startTouchY
-                    val distance = sqrt(totalDx * totalDx + totalDy * totalDy)
-                    val elapsed = System.currentTimeMillis() - downTime
-                    if (distance < tapDistancePx && elapsed < 500) {
-                        toggleMenu()
-                    }
-                    true
-                }
-                else -> false
-            }
-        }
-
-        windowManager.addView(handle, params)
-    }
-
-    // ---------- rotate handle (end tip) ----------
-
-    private fun addRotateHandle() {
-        val handle = makeHandleView(0x996699FF.toInt())
-        rotateHandle = handle
-
-        val params = WindowManager.LayoutParams(
-            handleSizePx,
-            handleSizePx,
-            overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.x = (endpointX() - handleSizePx / 2f).toInt()
-        params.y = (endpointY() - handleSizePx / 2f).toInt()
-        rotateParams = params
-
-        handle.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> true
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - centerX
-                    val dy = event.rawY - centerY
-                    angleDeg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
-                    refreshRotateHandlePosition()
-                    refreshLineVisual()
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
-                else -> false
-            }
-        }
-
-        windowManager.addView(handle, params)
-    }
-
-    private fun refreshRotateHandlePosition() {
-        rotateParams.x = (endpointX() - handleSizePx / 2f).toInt()
-        rotateParams.y = (endpointY() - handleSizePx / 2f).toInt()
-        rotateHandle?.let { windowManager.updateViewLayout(it, rotateParams) }
-    }
-
-    // ---------- menu ----------
 
     private fun toggleMenu() {
         val existingMenu = menuView
@@ -340,10 +279,6 @@ class OverlayService : Service() {
         menuView = null
         lineWindow?.let { windowManager.removeView(it) }
         lineWindow = null
-        moveHandle?.let { windowManager.removeView(it) }
-        moveHandle = null
-        rotateHandle?.let { windowManager.removeView(it) }
-        rotateHandle = null
         stopForeground(true)
         stopSelf()
     }
@@ -351,8 +286,6 @@ class OverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         lineWindow?.let { windowManager.removeView(it) }
-        moveHandle?.let { windowManager.removeView(it) }
-        rotateHandle?.let { windowManager.removeView(it) }
         menuView?.let { windowManager.removeView(it) }
     }
 }

@@ -8,10 +8,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -20,29 +19,42 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
-import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private var touchContainer: FrameLayout? = null
+    private var lineWindow: FrameLayout? = null
+    private var moveHandle: View? = null
+    private var rotateHandle: View? = null
     private var menuView: View? = null
+
     private lateinit var lineParams: WindowManager.LayoutParams
+    private lateinit var moveParams: WindowManager.LayoutParams
+    private lateinit var rotateParams: WindowManager.LayoutParams
 
     private val channelId = "overlay_line_channel"
-    private val longPressHandler = Handler(Looper.getMainLooper())
-    private var isVertical = true
+
+    private var centerX = 0f
+    private var centerY = 0f
+    private var angleDeg = -90f // -90 = pointing straight up (default vertical line)
+    private var halfLengthPx = 0f
+    private var handleSizePx = 0
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForegroundNotification()
-        addLineView()
+        setupGeometry()
+        addLineVisual()
+        addMoveHandle()
+        addRotateHandle()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,15 +70,13 @@ class OverlayService : Service() {
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
-
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Overlay Line aktif")
-            .setContentText("Tap garis untuk opsi, tahan 1 detik untuk putar arah")
+            .setContentText("Seret bulatan tengah = geser, bulatan ujung = putar")
             .setSmallIcon(android.R.drawable.presence_online)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
             .build()
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -82,87 +92,123 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
     }
 
-    private fun addLineView() {
+    private fun setupGeometry() {
         val density = resources.displayMetrics.density
+        halfLengthPx = (resources.displayMetrics.heightPixels * 0.8f) / 2f
+        handleSizePx = (44 * density).toInt()
+        centerX = resources.displayMetrics.widthPixels / 2f
+        centerY = resources.displayMetrics.heightPixels / 2f
+    }
 
+    private fun endpointX() = centerX + halfLengthPx * cos(Math.toRadians(angleDeg.toDouble())).toFloat()
+    private fun endpointY() = centerY + halfLengthPx * sin(Math.toRadians(angleDeg.toDouble())).toFloat()
+
+    // ---------- visual line (click-through, purely decorative) ----------
+
+    private fun addLineVisual() {
+        val density = resources.displayMetrics.density
         val visualThicknessPx = (4 * density).toInt()
-        val touchThicknessPx = (48 * density).toInt()
-        val lengthPx = (resources.displayMetrics.heightPixels * 0.8).toInt()
+        val boxSize = (halfLengthPx * 2 + handleSizePx * 2).toInt()
 
-        val container = FrameLayout(this)
-        val visualLine = View(this).apply {
-            setBackgroundColor(Color.WHITE)
-        }
-
-        val innerParams = if (isVertical) {
-            FrameLayout.LayoutParams(visualThicknessPx, FrameLayout.LayoutParams.MATCH_PARENT)
-        } else {
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, visualThicknessPx)
-        }
-        innerParams.gravity = Gravity.CENTER
-        container.addView(visualLine, innerParams)
-        touchContainer = container
+        val box = FrameLayout(this)
+        val bar = View(this).apply { setBackgroundColor(Color.WHITE) }
+        val barParams = FrameLayout.LayoutParams(visualThicknessPx, (halfLengthPx * 2).toInt())
+        barParams.gravity = Gravity.CENTER
+        box.addView(bar, barParams)
+        bar.rotation = angleDeg + 90f
+        lineWindow = box
 
         val params = WindowManager.LayoutParams(
-            if (isVertical) touchThicknessPx else lengthPx,
-            if (isVertical) lengthPx else touchThicknessPx,
+            boxSize,
+            boxSize,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        params.x = (centerX - boxSize / 2f).toInt()
+        params.y = (centerY - boxSize / 2f).toInt()
+        lineParams = params
+
+        windowManager.addView(box, params)
+    }
+
+    private fun refreshLineVisual() {
+        val box = lineWindow ?: return
+        val boxSize = (halfLengthPx * 2 + handleSizePx * 2).toInt()
+        lineParams.x = (centerX - boxSize / 2f).toInt()
+        lineParams.y = (centerY - boxSize / 2f).toInt()
+        windowManager.updateViewLayout(box, lineParams)
+        (box.getChildAt(0))?.rotation = angleDeg + 90f
+    }
+
+    // ---------- move handle (center) ----------
+
+    private fun makeHandleView(colorArgb: Int): View {
+        val v = View(this)
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(colorArgb)
+            setStroke(3, Color.WHITE)
+        }
+        v.background = bg
+        return v
+    }
+
+    private fun addMoveHandle() {
+        val handle = makeHandleView(0x99333333.toInt())
+        moveHandle = handle
+
+        val params = WindowManager.LayoutParams(
+            handleSizePx,
+            handleSizePx,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = (resources.displayMetrics.widthPixels - params.width) / 2
-        params.y = (resources.displayMetrics.heightPixels - params.height) / 2
+        params.x = (centerX - handleSizePx / 2f).toInt()
+        params.y = (centerY - handleSizePx / 2f).toInt()
+        moveParams = params
 
-        lineParams = params
-
-        var initialX = 0
-        var initialY = 0
-        var initialTouchX = 0f
-        var initialTouchY = 0f
-        var isDragging = false
+        var startTouchX = 0f
+        var startTouchY = 0f
+        var startCenterX = 0f
+        var startCenterY = 0f
         var downTime = 0L
-        var longPressTriggered = false
+        val tapDistancePx = 24 * resources.displayMetrics.density
 
-        val dragSlopPx = (24 * density)
-
-        val longPressRunnable = Runnable {
-            longPressTriggered = true
-            toggleOrientation()
-        }
-
-        container.setOnTouchListener { _, event ->
+        handle.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    initialX = lineParams.x
-                    initialY = lineParams.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    isDragging = false
-                    longPressTriggered = false
+                    startTouchX = event.rawX
+                    startTouchY = event.rawY
+                    startCenterX = centerX
+                    startCenterY = centerY
                     downTime = System.currentTimeMillis()
-                    longPressHandler.postDelayed(longPressRunnable, 500)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - initialTouchX)
-                    val dy = (event.rawY - initialTouchY)
-                    if (!isDragging && (abs(dx) > dragSlopPx || abs(dy) > dragSlopPx)) {
-                        isDragging = true
-                        longPressHandler.removeCallbacks(longPressRunnable)
-                    }
-                    if (isDragging) {
-                        lineParams.x = initialX + dx.toInt()
-                        lineParams.y = initialY + dy.toInt()
-                        windowManager.updateViewLayout(touchContainer, lineParams)
-                    }
+                    val dx = event.rawX - startTouchX
+                    val dy = event.rawY - startTouchY
+                    centerX = startCenterX + dx
+                    centerY = startCenterY + dy
+                    moveParams.x = (centerX - handleSizePx / 2f).toInt()
+                    moveParams.y = (centerY - handleSizePx / 2f).toInt()
+                    windowManager.updateViewLayout(moveHandle, moveParams)
+                    refreshLineVisual()
+                    refreshRotateHandlePosition()
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    longPressHandler.removeCallbacks(longPressRunnable)
+                    val totalDx = event.rawX - startTouchX
+                    val totalDy = event.rawY - startTouchY
+                    val distance = sqrt(totalDx * totalDx + totalDy * totalDy)
                     val elapsed = System.currentTimeMillis() - downTime
-                    if (!isDragging && !longPressTriggered && elapsed < 400) {
+                    if (distance < tapDistancePx && elapsed < 500) {
                         toggleMenu()
                     }
                     true
@@ -171,38 +217,54 @@ class OverlayService : Service() {
             }
         }
 
-        windowManager.addView(container, params)
+        windowManager.addView(handle, params)
     }
 
-    private fun toggleOrientation() {
-        isVertical = !isVertical
+    // ---------- rotate handle (end tip) ----------
 
-        val density = resources.displayMetrics.density
-        val touchThicknessPx = (48 * density).toInt()
-        val lengthPx = (resources.displayMetrics.heightPixels * 0.8).toInt()
+    private fun addRotateHandle() {
+        val handle = makeHandleView(0x996699FF.toInt())
+        rotateHandle = handle
 
-        val centerX = lineParams.x + lineParams.width / 2
-        val centerY = lineParams.y + lineParams.height / 2
+        val params = WindowManager.LayoutParams(
+            handleSizePx,
+            handleSizePx,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        params.x = (endpointX() - handleSizePx / 2f).toInt()
+        params.y = (endpointY() - handleSizePx / 2f).toInt()
+        rotateParams = params
 
-        lineParams.width = if (isVertical) touchThicknessPx else lengthPx
-        lineParams.height = if (isVertical) lengthPx else touchThicknessPx
-        lineParams.x = centerX - lineParams.width / 2
-        lineParams.y = centerY - lineParams.height / 2
-
-        val container = touchContainer ?: return
-        container.removeAllViews()
-        val visualThicknessPx = (4 * density).toInt()
-        val visualLine = View(this).apply { setBackgroundColor(Color.WHITE) }
-        val innerParams = if (isVertical) {
-            FrameLayout.LayoutParams(visualThicknessPx, FrameLayout.LayoutParams.MATCH_PARENT)
-        } else {
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, visualThicknessPx)
+        handle.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> true
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - centerX
+                    val dy = event.rawY - centerY
+                    angleDeg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+                    refreshRotateHandlePosition()
+                    refreshLineVisual()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
         }
-        innerParams.gravity = Gravity.CENTER
-        container.addView(visualLine, innerParams)
 
-        windowManager.updateViewLayout(container, lineParams)
+        windowManager.addView(handle, params)
     }
+
+    private fun refreshRotateHandlePosition() {
+        rotateParams.x = (endpointX() - handleSizePx / 2f).toInt()
+        rotateParams.y = (endpointY() - handleSizePx / 2f).toInt()
+        rotateHandle?.let { windowManager.updateViewLayout(it, rotateParams) }
+    }
+
+    // ---------- menu ----------
 
     private fun toggleMenu() {
         val existingMenu = menuView
@@ -222,18 +284,16 @@ class OverlayService : Service() {
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xCC000000.toInt())
-            setPadding(16, 16, 16, 16)
+            setBackgroundColor(0xEE000000.toInt())
+            setPadding(24, 24, 24, 24)
         }
 
         val stopItem = TextView(this).apply {
             text = "❌ Matikan Garis"
-            setTextColor(0xFFFF5555.toInt())
-            textSize = 14f
-            setPadding(24, 20, 24, 20)
-            setOnClickListener {
-                stopOverlayCompletely()
-            }
+            setTextColor(0xFFFF6666.toInt())
+            textSize = 15f
+            setPadding(24, 22, 24, 22)
+            setOnClickListener { stopOverlayCompletely() }
         }
         container.addView(stopItem)
 
@@ -243,8 +303,8 @@ class OverlayService : Service() {
             val item = TextView(this).apply {
                 text = label
                 setTextColor(0xFFFFFFFF.toInt())
-                textSize = 14f
-                setPadding(24, 20, 24, 20)
+                textSize = 15f
+                setPadding(24, 22, 24, 22)
                 setOnClickListener {
                     val launch = pm.getLaunchIntentForPackage(pkg)
                     if (launch != null) {
@@ -258,6 +318,7 @@ class OverlayService : Service() {
             container.addView(item)
         }
 
+        val density = resources.displayMetrics.density
         val menuParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -267,8 +328,8 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         )
         menuParams.gravity = Gravity.TOP or Gravity.START
-        menuParams.x = lineParams.x + lineParams.width + 20
-        menuParams.y = lineParams.y
+        menuParams.x = (40 * density).toInt()
+        menuParams.y = (80 * density).toInt()
 
         windowManager.addView(container, menuParams)
         menuView = container
@@ -277,16 +338,21 @@ class OverlayService : Service() {
     private fun stopOverlayCompletely() {
         menuView?.let { windowManager.removeView(it) }
         menuView = null
-        touchContainer?.let { windowManager.removeView(it) }
-        touchContainer = null
+        lineWindow?.let { windowManager.removeView(it) }
+        lineWindow = null
+        moveHandle?.let { windowManager.removeView(it) }
+        moveHandle = null
+        rotateHandle?.let { windowManager.removeView(it) }
+        rotateHandle = null
         stopForeground(true)
         stopSelf()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        longPressHandler.removeCallbacksAndMessages(null)
-        touchContainer?.let { windowManager.removeView(it) }
+        lineWindow?.let { windowManager.removeView(it) }
+        moveHandle?.let { windowManager.removeView(it) }
+        rotateHandle?.let { windowManager.removeView(it) }
         menuView?.let { windowManager.removeView(it) }
     }
 }

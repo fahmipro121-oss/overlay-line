@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
@@ -21,43 +22,57 @@ import androidx.core.app.NotificationCompat
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private var lineWindow: FrameLayout? = null
-    private var bar: View? = null
-    private var menuView: View? = null
-    private lateinit var lineParams: WindowManager.LayoutParams
-
     private val channelId = "overlay_line_channel"
 
-    private var centerX = 0f
-    private var centerY = 0f
-    private var angleDeg = -90f
-    private var lengthPx = 0f
-    private var thicknessPx = 0
+    // The two endpoints of the line, in absolute screen coordinates.
+    private var p1x = 0f
+    private var p1y = 0f
+    private var p2x = 0f
+    private var p2y = 0f
 
-    private var mode = "idle"
-    private var refTouchX = 0f
-    private var refTouchY = 0f
-    private var refCenterX = 0f
-    private var refCenterY = 0f
-    private var refAngle = 0f
-    private var refLineAngle = 0f
-    private var refMidX = 0f
-    private var refMidY = 0f
-    private var downTime = 0L
-    private var moved = false
+    private var thicknessPx = 0
+    private var handleSizePx = 0
+
+    private var lineVisual: FrameLayout? = null
+    private var lineBar: View? = null
+    private lateinit var lineParams: WindowManager.LayoutParams
+
+    private var handle1: View? = null
+    private lateinit var handle1Params: WindowManager.LayoutParams
+    private var handle2: View? = null
+    private lateinit var handle2Params: WindowManager.LayoutParams
+    private var handleMid: View? = null
+    private lateinit var handleMidParams: WindowManager.LayoutParams
+
+    private var menuView: View? = null
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startForegroundNotification()
-        setupGeometry()
-        addLineWindow()
+
+        val density = resources.displayMetrics.density
+        thicknessPx = (4 * density).toInt()
+        handleSizePx = (40 * density).toInt()
+
+        val cx = resources.displayMetrics.widthPixels / 2f
+        val cy = resources.displayMetrics.heightPixels / 2f
+        val halfLen = resources.displayMetrics.heightPixels * 0.4f
+        p1x = cx; p1y = cy - halfLen
+        p2x = cx; p2y = cy + halfLen
+
+        addLineVisual()
+        addHandle1()
+        addHandle2()
+        addHandleMid()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -74,7 +89,7 @@ class OverlayService : Service() {
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Overlay Line aktif")
-            .setContentText("1 jari geser, 2 jari putar, tap buka menu")
+            .setContentText("Seret titik ujung = putar, titik tengah = geser")
             .setSmallIcon(android.R.drawable.presence_online)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
@@ -94,131 +109,189 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
     }
 
-    private fun setupGeometry() {
-        val density = resources.displayMetrics.density
-        lengthPx = resources.displayMetrics.heightPixels * 0.8f
-        thicknessPx = (28 * density).toInt()
-        centerX = resources.displayMetrics.widthPixels / 2f
-        centerY = resources.displayMetrics.heightPixels / 2f
+    private fun makeHandleView(): View {
+        val v = View(this)
+        v.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.WHITE)
+            setStroke(2, Color.DKGRAY)
+        }
+        return v
     }
 
-    // Axis-aligned bounding box of the rotated line, so the touchable
-    // window is only as big as it needs to be for the current angle —
-    // not a full-screen square. Rest of the screen stays clickable.
-    private fun currentBoxSize(): Pair<Int, Int> {
-        val rad = Math.toRadians(angleDeg.toDouble())
-        val w = (lengthPx * abs(sin(rad)) + thicknessPx * abs(cos(rad))).toInt()
-        val h = (lengthPx * abs(cos(rad)) + thicknessPx * abs(sin(rad)))
-        return Pair(max(w, thicknessPx), max(h.toInt(), thicknessPx))
-    }
+    // ---------- visual line: pure decoration, click-through ----------
 
-    private fun addLineWindow() {
-        val container = FrameLayout(this)
-        val visualBar = View(this).apply { setBackgroundColor(Color.WHITE) }
-        val barParams = FrameLayout.LayoutParams(thicknessPx, lengthPx.toInt())
-        barParams.gravity = Gravity.CENTER
-        container.addView(visualBar, barParams)
-        visualBar.rotation = angleDeg + 90f
-        lineWindow = container
-        bar = visualBar
+    private fun addLineVisual() {
+        val box = FrameLayout(this)
+        val bar = View(this).apply { setBackgroundColor(Color.WHITE) }
+        box.addView(bar, FrameLayout.LayoutParams(thicknessPx, thicknessPx))
+        lineVisual = box
+        lineBar = bar
 
-        val (boxW, boxH) = currentBoxSize()
         val params = WindowManager.LayoutParams(
-            boxW,
-            boxH,
+            thicknessPx, thicknessPx,
             overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = (centerX - boxW / 2f).toInt()
-        params.y = (centerY - boxH / 2f).toInt()
         lineParams = params
-
-        container.setOnTouchListener { _, event -> handleTouch(event) }
-
-        windowManager.addView(container, params)
+        windowManager.addView(box, params)
+        refreshLineVisual()
     }
 
-    private fun handleTouch(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                mode = "drag"
-                refTouchX = event.rawX
-                refTouchY = event.rawY
-                refCenterX = centerX
-                refCenterY = centerY
-                downTime = System.currentTimeMillis()
-                moved = false
-            }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                if (event.pointerCount >= 2) {
-                    mode = "rotate"
-                    val x0 = event.getX(0); val y0 = event.getY(0)
-                    val x1 = event.getX(1); val y1 = event.getY(1)
-                    refAngle = Math.toDegrees(atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
-                    refLineAngle = angleDeg
-                    refMidX = (x0 + x1) / 2f
-                    refMidY = (y0 + y1) / 2f
-                    refCenterX = centerX
-                    refCenterY = centerY
-                    moved = true
-                }
-            }
-            MotionEvent.ACTION_MOVE -> {
-                if (mode == "rotate" && event.pointerCount >= 2) {
-                    val x0 = event.getX(0); val y0 = event.getY(0)
-                    val x1 = event.getX(1); val y1 = event.getY(1)
-                    val currentAngle = Math.toDegrees(atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
-                    val delta = currentAngle - refAngle
-                    angleDeg = refLineAngle + delta
-                    val midX = (x0 + x1) / 2f
-                    val midY = (y0 + y1) / 2f
-                    centerX = refCenterX + (midX - refMidX)
-                    centerY = refCenterY + (midY - refMidY)
-                    applyGeometry()
-                } else if (mode == "drag") {
-                    val dx = event.rawX - refTouchX
-                    val dy = event.rawY - refTouchY
-                    if (abs(dx) > 6 || abs(dy) > 6) moved = true
-                    centerX = refCenterX + dx
-                    centerY = refCenterY + dy
-                    applyGeometry()
-                }
-            }
-            MotionEvent.ACTION_POINTER_UP -> {
-                mode = "drag"
-                val remainingIndex = if (event.actionIndex == 0) 1 else 0
-                if (remainingIndex < event.pointerCount) {
-                    refTouchX = lineParams.x + event.getX(remainingIndex)
-                    refTouchY = lineParams.y + event.getY(remainingIndex)
-                }
-                refCenterX = centerX
-                refCenterY = centerY
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val elapsed = System.currentTimeMillis() - downTime
-                if (!moved && elapsed < 500) {
-                    toggleMenu()
-                }
-                mode = "idle"
-            }
-        }
-        return true
-    }
+    private fun refreshLineVisual() {
+        val box = lineVisual ?: return
+        val bar = lineBar ?: return
 
-    private fun applyGeometry() {
-        val container = lineWindow ?: return
-        val visualBar = bar ?: return
-        val (boxW, boxH) = currentBoxSize()
+        val dx = p2x - p1x
+        val dy = p2y - p1y
+        val length = hypot(dx, dy)
+        val angle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+
+        val rad = Math.toRadians(angle.toDouble())
+        val boxW = max((length * abs(sin(rad)) + thicknessPx * abs(cos(rad))).toInt(), thicknessPx)
+        val boxH = max((length * abs(cos(rad)) + thicknessPx * abs(sin(rad))).toInt(), thicknessPx)
+
+        val barParams = FrameLayout.LayoutParams(thicknessPx, max(length.toInt(), 1))
+        barParams.gravity = Gravity.CENTER
+        bar.layoutParams = barParams
+        bar.rotation = angle + 90f
+
+        val cx = (p1x + p2x) / 2f
+        val cy = (p1y + p2y) / 2f
         lineParams.width = boxW
         lineParams.height = boxH
-        lineParams.x = (centerX - boxW / 2f).toInt()
-        lineParams.y = (centerY - boxH / 2f).toInt()
-        windowManager.updateViewLayout(container, lineParams)
-        visualBar.rotation = angleDeg + 90f
+        lineParams.x = (cx - boxW / 2f).toInt()
+        lineParams.y = (cy - boxH / 2f).toInt()
+        windowManager.updateViewLayout(box, lineParams)
     }
+
+    // ---------- endpoint handles: drag freely, pivots the other end ----------
+
+    private fun addHandle1() {
+        val h = makeHandleView()
+        handle1 = h
+        val params = WindowManager.LayoutParams(
+            handleSizePx, handleSizePx, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        handle1Params = params
+        var offX = 0f; var offY = 0f
+        h.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { offX = event.rawX - p1x; offY = event.rawY - p1y }
+                MotionEvent.ACTION_MOVE -> {
+                    p1x = event.rawX - offX
+                    p1y = event.rawY - offY
+                    repositionHandle(handle1, handle1Params, p1x, p1y)
+                    repositionHandle(handleMid, handleMidParams, (p1x + p2x) / 2f, (p1y + p2y) / 2f)
+                    refreshLineVisual()
+                }
+                else -> {}
+            }
+            true
+        }
+        repositionHandle(h, params, p1x, p1y)
+        windowManager.addView(h, params)
+    }
+
+    private fun addHandle2() {
+        val h = makeHandleView()
+        handle2 = h
+        val params = WindowManager.LayoutParams(
+            handleSizePx, handleSizePx, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        handle2Params = params
+        var offX = 0f; var offY = 0f
+        h.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { offX = event.rawX - p2x; offY = event.rawY - p2y }
+                MotionEvent.ACTION_MOVE -> {
+                    p2x = event.rawX - offX
+                    p2y = event.rawY - offY
+                    repositionHandle(handle2, handle2Params, p2x, p2y)
+                    repositionHandle(handleMid, handleMidParams, (p1x + p2x) / 2f, (p1y + p2y) / 2f)
+                    refreshLineVisual()
+                }
+                else -> {}
+            }
+            true
+        }
+        repositionHandle(h, params, p2x, p2y)
+        windowManager.addView(h, params)
+    }
+
+    // ---------- middle handle: drag = move whole line, tap = menu ----------
+
+    private fun addHandleMid() {
+        val h = makeHandleView()
+        handleMid = h
+        val params = WindowManager.LayoutParams(
+            handleSizePx, handleSizePx, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        handleMidParams = params
+
+        var startTouchX = 0f; var startTouchY = 0f
+        var startP1x = 0f; var startP1y = 0f; var startP2x = 0f; var startP2y = 0f
+        var downTime = 0L
+        var moved = false
+        val tapDist = 20 * resources.displayMetrics.density
+
+        h.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startTouchX = event.rawX; startTouchY = event.rawY
+                    startP1x = p1x; startP1y = p1y; startP2x = p2x; startP2y = p2y
+                    downTime = System.currentTimeMillis()
+                    moved = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - startTouchX
+                    val dy = event.rawY - startTouchY
+                    if (abs(dx) > 6 || abs(dy) > 6) moved = true
+                    p1x = startP1x + dx; p1y = startP1y + dy
+                    p2x = startP2x + dx; p2y = startP2y + dy
+                    repositionHandle(handle1, handle1Params, p1x, p1y)
+                    repositionHandle(handle2, handle2Params, p2x, p2y)
+                    repositionHandle(handleMid, handleMidParams, (p1x + p2x) / 2f, (p1y + p2y) / 2f)
+                    refreshLineVisual()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val totalDx = event.rawX - startTouchX
+                    val totalDy = event.rawY - startTouchY
+                    val dist = sqrt(totalDx * totalDx + totalDy * totalDy)
+                    val elapsed = System.currentTimeMillis() - downTime
+                    if (!moved && dist < tapDist && elapsed < 500) {
+                        toggleMenu()
+                    }
+                }
+                else -> {}
+            }
+            true
+        }
+        repositionHandle(h, params, (p1x + p2x) / 2f, (p1y + p2y) / 2f)
+        windowManager.addView(h, params)
+    }
+
+    private fun repositionHandle(view: View?, params: WindowManager.LayoutParams, x: Float, y: Float) {
+        if (view == null) return
+        params.x = (x - handleSizePx / 2f).toInt()
+        params.y = (y - handleSizePx / 2f).toInt()
+        windowManager.updateViewLayout(view, params)
+    }
+
+    // ---------- menu ----------
 
     private fun toggleMenu() {
         val existingMenu = menuView
@@ -292,15 +365,24 @@ class OverlayService : Service() {
     private fun stopOverlayCompletely() {
         menuView?.let { windowManager.removeView(it) }
         menuView = null
-        lineWindow?.let { windowManager.removeView(it) }
-        lineWindow = null
+        lineVisual?.let { windowManager.removeView(it) }
+        lineVisual = null
+        handle1?.let { windowManager.removeView(it) }
+        handle1 = null
+        handle2?.let { windowManager.removeView(it) }
+        handle2 = null
+        handleMid?.let { windowManager.removeView(it) }
+        handleMid = null
         stopForeground(true)
         stopSelf()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        lineWindow?.let { windowManager.removeView(it) }
+        lineVisual?.let { windowManager.removeView(it) }
+        handle1?.let { windowManager.removeView(it) }
+        handle2?.let { windowManager.removeView(it) }
+        handleMid?.let { windowManager.removeView(it) }
         menuView?.let { windowManager.removeView(it) }
     }
 }

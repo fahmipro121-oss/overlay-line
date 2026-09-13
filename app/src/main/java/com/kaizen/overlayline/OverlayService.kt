@@ -20,7 +20,6 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.sqrt
 
 class OverlayService : Service() {
 
@@ -37,7 +36,6 @@ class OverlayService : Service() {
     private var lengthPx = 0f
     private var boxSize = 0
 
-    // gesture state
     private var mode = "idle"
     private var refTouchX = 0f
     private var refTouchY = 0f
@@ -116,7 +114,8 @@ class OverlayService : Service() {
             boxSize,
             boxSize,
             overlayType(),
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
